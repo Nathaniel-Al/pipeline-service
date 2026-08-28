@@ -6,7 +6,7 @@ import copy
 
 app = FastAPI()
 
-# Global session storage mapping: session_id -> SessionState
+# In-memory store for session states
 SESSIONS = {}
 
 DAG_NODES = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
@@ -23,15 +23,20 @@ EVENT_FIELDS = {
 }
 
 
+def is_pos_int(val):
+    """Checks if a value is a positive integer (excluding boolean)."""
+    return isinstance(val, int) and not isinstance(val, bool) and val > 0
+
+
 def compute_sha256(data_list):
-    """Computes lowercase SHA-256 over UTF-8 compact JSON array."""
-    json_str = json.dumps(data_list, separators=(',', ':'))
-    return hashlib.sha256(json_str.encode("utf-8")).hexdigest().lower()
+    """Computes lowercase SHA-256 over exact UTF-8 compact JSON arrays."""
+    json_bytes = json.dumps(data_list, separators=(',', ':'), ensure_ascii=False).encode("utf-8")
+    return hashlib.sha256(json_bytes).hexdigest().lower()
 
 
-def get_canonical_event_json(event_dict):
-    """Computes compact canonical JSON for event ID collision checks."""
-    return json.dumps(event_dict, sort_keys=True, separators=(',', ':'))
+def get_canonical_event_json(ev_dict):
+    """Computes compact canonical JSON representation for event ID uniqueness checks."""
+    return json.dumps(ev_dict, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
 
 
 class SessionState:
@@ -39,21 +44,14 @@ class SessionState:
         self.session_id = session_id
         self.revision = revision
         self.inputs = inputs
-        # eventId -> canonical JSON string
-        self.seen_events = {}
-        # (node, cacheKey) -> {"artifactDigest": ..., "eventId": ..., "receiptId": ...}
-        self.cache = {}
-        # node -> {"status": ..., "attempt": ..., "key": ..., "bound_artifact": ..., "bound_receipt": ..., "accepted_events": []}
-        self.node_states = {n: {"status": "none", "attempt": 0, "key": None, "bound_artifact": None, "bound_receipt": None, "accepted_events": []} for n in DAG_NODES}
+        self.seen_events = {}  # eventId -> canonical JSON string
+        self.cache = {}        # (node, cacheKey) -> {"artifactDigest": ..., "eventId": ..., "receiptId": ...}
+        self.reset_node_states()
 
-    def reset_non_cached_node_states(self):
-        """When revision changes, clear active execution state for non-cached nodes."""
-        for n in DAG_NODES:
-            curr = self.node_states[n]
-            k = curr.get("key")
-            if k and (n, k) in self.cache:
-                continue
-            self.node_states[n] = {
+    def reset_node_states(self):
+        """Clears active attempt and terminal state across revisions."""
+        self.node_states = {
+            n: {
                 "status": "none",
                 "attempt": 0,
                 "key": None,
@@ -61,115 +59,129 @@ class SessionState:
                 "bound_receipt": None,
                 "accepted_events": []
             }
+            for n in DAG_NODES
+        }
 
 
 def compute_node_inputs_and_key(node, inputs, session_cache):
-    """Computes dependency inputs dictionary and cacheKey for a given DAG node."""
+    """Computes dependency inputs dictionary and parent-gated cacheKey."""
     if node == "verify_data":
-        dep_inputs = {
+        dep_dict = {
             "generation": inputs["generation"],
             "checksum": inputs["checksum"]
         }
-        key_data = [inputs["generation"], inputs["checksum"]]
-        return dep_inputs, compute_sha256(key_data)
+        key = compute_sha256([inputs["generation"], inputs["checksum"]])
+        dep_dict["cacheKey"] = key
+        return dep_dict, key
 
     elif node == "prepare":
-        parent_cache = session_cache.get(("verify_data", compute_sha256([inputs["generation"], inputs["checksum"]])))
-        if not parent_cache:
-            return {
-                "canonicalData": inputs["canonicalData"],
-                "prepareCode": inputs["prepareCode"],
-                "prepareConfig": inputs["prepareConfig"],
-                "cacheKey": None
-            }, None
+        _, p_key = compute_node_inputs_and_key("verify_data", inputs, session_cache)
+        p_reusable = ("verify_data", p_key) in session_cache if p_key else False
 
-        dep_inputs = {
+        dep_dict = {
             "canonicalData": inputs["canonicalData"],
             "prepareCode": inputs["prepareCode"],
             "prepareConfig": inputs["prepareConfig"]
         }
-        key_data = [inputs["canonicalData"], inputs["prepareCode"], inputs["prepareConfig"]]
-        return dep_inputs, compute_sha256(key_data)
+        if not p_reusable:
+            dep_dict["cacheKey"] = None
+            return dep_dict, None
+
+        key = compute_sha256([inputs["canonicalData"], inputs["prepareCode"], inputs["prepareConfig"]])
+        dep_dict["cacheKey"] = key
+        return dep_dict, key
 
     elif node == "train":
-        p_inputs, p_key = compute_node_inputs_and_key("prepare", inputs, session_cache)
-        parent_cache = session_cache.get(("prepare", p_key)) if p_key else None
-        if not parent_cache:
-            return {
+        _, p_key = compute_node_inputs_and_key("prepare", inputs, session_cache)
+        p_reusable = ("prepare", p_key) in session_cache if p_key else False
+
+        if not p_reusable:
+            dep_dict = {
                 "prepareArtifact": None,
                 "trainCode": inputs["trainCode"],
                 "trainConfig": inputs["trainConfig"],
                 "runtime": inputs["runtime"],
                 "cacheKey": None
-            }, None
+            }
+            return dep_dict, None
 
-        p_artifact = parent_cache["artifactDigest"]
-        dep_inputs = {
+        p_artifact = session_cache[("prepare", p_key)]["artifactDigest"]
+        dep_dict = {
             "prepareArtifact": p_artifact,
             "trainCode": inputs["trainCode"],
             "trainConfig": inputs["trainConfig"],
             "runtime": inputs["runtime"]
         }
-        key_data = [p_artifact, inputs["trainCode"], inputs["trainConfig"], inputs["runtime"]]
-        return dep_inputs, compute_sha256(key_data)
+        key = compute_sha256([p_artifact, inputs["trainCode"], inputs["trainConfig"], inputs["runtime"]])
+        dep_dict["cacheKey"] = key
+        return dep_dict, key
 
     elif node == "evaluate":
-        p_inputs, p_key = compute_node_inputs_and_key("train", inputs, session_cache)
-        parent_cache = session_cache.get(("train", p_key)) if p_key else None
-        if not parent_cache:
-            return {
+        _, p_key = compute_node_inputs_and_key("train", inputs, session_cache)
+        p_reusable = ("train", p_key) in session_cache if p_key else False
+
+        if not p_reusable:
+            dep_dict = {
                 "trainArtifact": None,
                 "canonicalData": inputs["canonicalData"],
                 "evaluateCode": inputs["evaluateCode"],
                 "evaluateConfig": inputs["evaluateConfig"],
                 "cacheKey": None
-            }, None
+            }
+            return dep_dict, None
 
-        p_artifact = parent_cache["artifactDigest"]
-        dep_inputs = {
+        p_artifact = session_cache[("train", p_key)]["artifactDigest"]
+        dep_dict = {
             "trainArtifact": p_artifact,
             "canonicalData": inputs["canonicalData"],
             "evaluateCode": inputs["evaluateCode"],
             "evaluateConfig": inputs["evaluateConfig"]
         }
-        key_data = [p_artifact, inputs["canonicalData"], inputs["evaluateCode"], inputs["evaluateConfig"]]
-        return dep_inputs, compute_sha256(key_data)
+        key = compute_sha256([p_artifact, inputs["canonicalData"], inputs["evaluateCode"], inputs["evaluateConfig"]])
+        dep_dict["cacheKey"] = key
+        return dep_dict, key
 
     elif node == "register":
-        p_inputs, p_key = compute_node_inputs_and_key("evaluate", inputs, session_cache)
-        parent_cache = session_cache.get(("evaluate", p_key)) if p_key else None
-        if not parent_cache:
-            return {
+        _, p_key = compute_node_inputs_and_key("evaluate", inputs, session_cache)
+        p_reusable = ("evaluate", p_key) in session_cache if p_key else False
+
+        if not p_reusable:
+            dep_dict = {
                 "evaluateArtifact": None,
                 "schemaDigest": inputs["schemaDigest"],
                 "cacheKey": None
-            }, None
+            }
+            return dep_dict, None
 
-        p_artifact = parent_cache["artifactDigest"]
-        dep_inputs = {
+        p_artifact = session_cache[("evaluate", p_key)]["artifactDigest"]
+        dep_dict = {
             "evaluateArtifact": p_artifact,
             "schemaDigest": inputs["schemaDigest"]
         }
-        key_data = [p_artifact, inputs["schemaDigest"]]
-        return dep_inputs, compute_sha256(key_data)
+        key = compute_sha256([p_artifact, inputs["schemaDigest"]])
+        dep_dict["cacheKey"] = key
+        return dep_dict, key
 
     elif node == "publish":
-        p_inputs, p_key = compute_node_inputs_and_key("register", inputs, session_cache)
-        parent_cache = session_cache.get(("register", p_key)) if p_key else None
-        if not parent_cache:
-            return {
+        _, p_key = compute_node_inputs_and_key("register", inputs, session_cache)
+        p_reusable = ("register", p_key) in session_cache if p_key else False
+
+        if not p_reusable:
+            dep_dict = {
                 "registerArtifact": None,
                 "publishConfig": inputs["publishConfig"],
                 "cacheKey": None
-            }, None
+            }
+            return dep_dict, None
 
-        p_artifact = parent_cache["artifactDigest"]
-        dep_inputs = {
+        p_artifact = session_cache[("register", p_key)]["artifactDigest"]
+        dep_dict = {
             "registerArtifact": p_artifact,
             "publishConfig": inputs["publishConfig"]
         }
-        key_data = [p_artifact, inputs["publishConfig"]]
-        return dep_inputs, compute_sha256(key_data)
+        key = compute_sha256([p_artifact, inputs["publishConfig"]])
+        dep_dict["cacheKey"] = key
+        return dep_dict, key
 
     return {}, None
 
@@ -181,7 +193,7 @@ async def pipeline(request: Request):
     except Exception:
         return JSONResponse({"error": "INVALID_REQUEST"}, status_code=409)
 
-    # 1. Request Structure Validation
+    # 1. Structural Request Validation
     if not isinstance(body, dict):
         return JSONResponse({"error": "INVALID_REQUEST"}, status_code=409)
 
@@ -193,15 +205,15 @@ async def pipeline(request: Request):
     if not isinstance(session_id, str) or len(session_id) == 0:
         return JSONResponse({"error": "INVALID_REQUEST"}, status_code=409)
 
-    if not isinstance(revision, int) or revision <= 0 or isinstance(revision, bool):
+    if not is_pos_int(revision):
         return JSONResponse({"error": "INVALID_REQUEST"}, status_code=409)
 
     if not isinstance(inputs, dict):
         return JSONResponse({"error": "INVALID_REQUEST"}, status_code=409)
 
     for k in REQUIRED_INPUT_KEYS:
-        val = inputs.get(k)
-        if not isinstance(val, str) or len(val) == 0:
+        v = inputs.get(k)
+        if not isinstance(v, str) or len(v) == 0:
             return JSONResponse({"error": "INVALID_REQUEST"}, status_code=409)
 
     if not isinstance(events, list):
@@ -213,17 +225,21 @@ async def pipeline(request: Request):
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
         if set(ev.keys()) != EVENT_FIELDS:
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
-        if not isinstance(ev["eventId"], str) or len(ev["eventId"]) == 0:
+        if not isinstance(ev.get("eventId"), str) or len(ev["eventId"]) == 0:
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
-        if not isinstance(ev["revision"], int) or ev["revision"] <= 0 or isinstance(ev["revision"], bool):
+        if not is_pos_int(ev.get("revision")):
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
-        if not isinstance(ev["node"], str):
+        if not isinstance(ev.get("node"), str):
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
-        if not isinstance(ev["attempt"], int) or ev["attempt"] <= 0 or isinstance(ev["attempt"], bool):
+        if not is_pos_int(ev.get("attempt")):
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
-        if not isinstance(ev["status"], str):
+        if not isinstance(ev.get("status"), str):
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
-        if not isinstance(ev["key"], str) or len(ev["key"]) == 0:
+        if not isinstance(ev.get("key"), str) or len(ev["key"]) == 0:
+            return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
+        if ev.get("artifactDigest") is not None and not isinstance(ev["artifactDigest"], str):
+            return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
+        if ev.get("receiptId") is not None and not isinstance(ev["receiptId"], str):
             return JSONResponse({"error": "INVALID_EVENT"}, status_code=409)
 
     # 3. Session & Revision Management
@@ -240,15 +256,15 @@ async def pipeline(request: Request):
         else:
             session.revision = revision
             session.inputs = inputs
-            session.reset_non_cached_node_states()
+            session.reset_node_states()
 
-    # Create working copy for atomic batch rollback on error
+    # Deep copy for atomic batch processing
     work = copy.deepcopy(session)
 
     accepted_event_ids = []
     ignored_event_ids = []
 
-    # 4. Event Batch Processing
+    # 4. Batch Event Processing
     for ev in events:
         ev_id = ev["eventId"]
         ev_json = get_canonical_event_json(ev)
@@ -261,7 +277,7 @@ async def pipeline(request: Request):
             else:
                 return JSONResponse({"error": "EVENT_ID_CONFLICT"}, status_code=409)
 
-        # Basic filtering: Revision, Node & Format validation
+        # Basic Filter Rules (Ignore if mismatch)
         if ev["revision"] != work.revision:
             ignored_event_ids.append(ev_id)
             continue
@@ -276,7 +292,7 @@ async def pipeline(request: Request):
             ignored_event_ids.append(ev_id)
             continue
 
-        # Artifact Digest validation
+        # Artifact Digest Validation
         art_digest = ev["artifactDigest"]
         if status == "succeeded":
             if not isinstance(art_digest, str) or len(art_digest) == 0:
@@ -287,7 +303,7 @@ async def pipeline(request: Request):
                 ignored_event_ids.append(ev_id)
                 continue
 
-        # Receipt validation
+        # Receipt Validation
         rcpt = ev["receiptId"]
         if status == "succeeded" and node in ["register", "publish"]:
             expected_rcpt = f"receipt:{node}:{ev['key']}"
@@ -299,38 +315,40 @@ async def pipeline(request: Request):
                 ignored_event_ids.append(ev_id)
                 continue
 
-        # Check key against expected node key based on inputs and parent reusable state
+        # Key / Parent Availability Check
         _, expected_key = compute_node_inputs_and_key(node, work.inputs, work.cache)
         if not expected_key or ev["key"] != expected_key:
             ignored_event_ids.append(ev_id)
             continue
 
-        # Retrieve current node state
-        curr_state = work.node_states[node]
-        c_status = curr_state["status"]
-        c_attempt = curr_state["attempt"]
-        c_key = curr_state["key"]
+        node_st = work.node_states[node]
 
-        # Check if already cached in session
-        if (node, expected_key) in work.cache:
-            bound_info = work.cache[(node, expected_key)]
+        # Transition Checks on Cached/Succeeded State
+        if (node, expected_key) in work.cache or node_st["status"] == "succeeded":
+            rec_art = (
+                work.cache[(node, expected_key)]["artifactDigest"]
+                if (node, expected_key) in work.cache
+                else node_st["bound_artifact"]
+            )
             if status == "succeeded":
-                if art_digest != bound_info["artifactDigest"]:
+                if art_digest != rec_art:
                     return JSONResponse({"error": "EVIDENCE_CONFLICT"}, status_code=409)
                 else:
                     return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
             else:
                 return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
 
-        # State transition evaluation
+        c_status = node_st["status"]
+        c_attempt = node_st["attempt"]
         attempt = ev["attempt"]
 
+        # Non-cached State Transitions
         if c_status == "none":
             if status == "started" and attempt == 1:
-                curr_state["status"] = "started"
-                curr_state["attempt"] = 1
-                curr_state["key"] = expected_key
-                curr_state["accepted_events"].append(ev_id)
+                node_st["status"] = "started"
+                node_st["attempt"] = 1
+                node_st["key"] = expected_key
+                node_st["accepted_events"].append(ev_id)
             else:
                 ignored_event_ids.append(ev_id)
                 continue
@@ -341,11 +359,11 @@ async def pipeline(request: Request):
                 continue
             elif attempt == c_attempt:
                 if status in ["succeeded", "retryable_failed", "terminal_failed"]:
-                    curr_state["status"] = status
-                    curr_state["accepted_events"].append(ev_id)
+                    node_st["status"] = status
+                    node_st["accepted_events"].append(ev_id)
                     if status == "succeeded":
-                        curr_state["bound_artifact"] = art_digest
-                        curr_state["bound_receipt"] = rcpt
+                        node_st["bound_artifact"] = art_digest
+                        node_st["bound_receipt"] = rcpt
                         work.cache[(node, expected_key)] = {
                             "artifactDigest": art_digest,
                             "eventId": ev_id,
@@ -357,44 +375,38 @@ async def pipeline(request: Request):
                 return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
 
         elif c_status == "retryable_failed":
-            if attempt < c_attempt + 1:
+            if attempt <= c_attempt:
                 ignored_event_ids.append(ev_id)
                 continue
-            elif attempt == c_attempt + 1 and status == "started":
-                curr_state["status"] = "started"
-                curr_state["attempt"] = attempt
-                curr_state["accepted_events"].append(ev_id)
-            else:
-                return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
-
-        elif c_status == "succeeded":
-            if status == "succeeded" and art_digest != curr_state["bound_artifact"]:
-                return JSONResponse({"error": "EVIDENCE_CONFLICT"}, status_code=409)
+            elif attempt == c_attempt + 1:
+                if status == "started":
+                    node_st["status"] = "started"
+                    node_st["attempt"] = attempt
+                    node_st["accepted_events"].append(ev_id)
+                else:
+                    return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
             else:
                 return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
 
         elif c_status == "terminal_failed":
             return JSONResponse({"error": "STATUS_CONFLICT"}, status_code=409)
 
-        # Mark event accepted and store canonical representation
         work.seen_events[ev_id] = ev_json
         accepted_event_ids.append(ev_id)
 
-    # 5. Build Response DAG Node States
+  # 5. Build Response DAG Node States
     response_nodes = []
     upstream_terminal_flag = False
 
     for node in DAG_NODES:
-        dep_inputs, key = compute_node_inputs_and_key(node, work.inputs, work.cache)
-        dep_digests = copy.deepcopy(dep_inputs)
-        dep_digests["cacheKey"] = key
+        dep_dict, key = compute_node_inputs_and_key(node, work.inputs, work.cache)
 
         if upstream_terminal_flag:
             response_nodes.append({
                 "node": node,
                 "action": "block",
                 "reasonCodes": ["UPSTREAM_TERMINAL"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": []
             })
             continue
@@ -404,33 +416,32 @@ async def pipeline(request: Request):
                 "node": node,
                 "action": "block",
                 "reasonCodes": ["UPSTREAM_PENDING"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": []
             })
             continue
 
-        # Check content-addressed cache
         if (node, key) in work.cache:
             cache_info = work.cache[(node, key)]
             response_nodes.append({
                 "node": node,
                 "action": "reuse",
                 "reasonCodes": ["CACHE_HIT"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": [cache_info["eventId"]]
             })
             continue
 
-        curr_state = work.node_states[node]
-        c_status = curr_state["status"]
-        c_events = curr_state["accepted_events"]
+        node_st = work.node_states[node]
+        c_status = node_st["status"]
+        c_events = node_st["accepted_events"]
 
         if c_status == "none":
             response_nodes.append({
                 "node": node,
                 "action": "rerun",
                 "reasonCodes": ["CACHE_MISS"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": []
             })
 
@@ -439,7 +450,7 @@ async def pipeline(request: Request):
                 "node": node,
                 "action": "block",
                 "reasonCodes": ["RUNNING"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": c_events
             })
 
@@ -448,7 +459,7 @@ async def pipeline(request: Request):
                 "node": node,
                 "action": "rerun",
                 "reasonCodes": ["RETRYABLE_FAILURE"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": c_events
             })
 
@@ -457,12 +468,12 @@ async def pipeline(request: Request):
                 "node": node,
                 "action": "block",
                 "reasonCodes": ["TERMINAL_FAILURE"],
-                "dependencyDigests": dep_digests,
+                "dependencyDigests": dep_dict,
                 "triggeringEventIds": c_events
             })
             upstream_terminal_flag = True
 
-    # Commit successful working state copy back to session
+    # Commit updated state on success
     SESSIONS[session_id] = work
 
     return JSONResponse({
