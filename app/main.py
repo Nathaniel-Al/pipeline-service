@@ -14,7 +14,8 @@ from fastapi.responses import JSONResponse
 from app.pipeline import process_pipeline
 
 app = FastAPI()
-DB_PATH = os.environ.get("QUANTIZE_DB", "/tmp/quantize_state.sqlite3")
+#DB_PATH = os.environ.get("QUANTIZE_DB", "/tmp/quantize_state.sqlite3")
+DB_PATH = os.environ.get("QUANTIZE_DB", "./data/quantize_state.sqlite3")
 DB_LOCK = threading.RLock()
 
 FREEZE_CODES = {
