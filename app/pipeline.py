@@ -2,16 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import sqlite3
 import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
-# Global database connection and lock
 DB_LOCK = threading.RLock()
-DB_PATH = os.environ.get("PIPELINE_DB", "./data/pipeline_state.sqlite3")
-_db_instance = None
 
 # DAG structure: fixed ordering with dependencies
 DAG_NODES = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
@@ -24,7 +20,7 @@ DAG_PARENTS = {
     "publish": ["register"],
 }
 
-# Inputs required for each node's cache key (ORDER MATTERS)
+# Inputs required for each node's cache key
 NODE_INPUTS = {
     "verify_data": ["generation", "checksum"],
     "prepare": ["canonicalData", "prepareCode", "prepareConfig"],
@@ -43,7 +39,6 @@ class NodeState:
     artifact_digest: Optional[str] = None
     event_id: Optional[str] = None
     receipt_id: Optional[str] = None
-    cache_key: Optional[str] = None  # Immutable cache key once succeeded
 
 
 @dataclass
@@ -57,16 +52,11 @@ class SessionState:
     event_canonical: dict[str, str]
 
 
-def init_db() -> None:
-    """Initialize database with persistent storage"""
-    global _db_instance
-    db_dir = os.path.dirname(DB_PATH)
-    if db_dir and not os.path.exists(db_dir):
-        os.makedirs(db_dir, exist_ok=True)
-    
-    _db_instance = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    _db_instance.execute(
-        "CREATE TABLE IF NOT EXISTS pipeline_sessions ("
+def get_db() -> sqlite3.Connection:
+    """Get database connection"""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS sessions ("
         "session TEXT PRIMARY KEY, "
         "revision INTEGER NOT NULL, "
         "inputs TEXT NOT NULL, "
@@ -74,18 +64,12 @@ def init_db() -> None:
         "event_ids_seen TEXT NOT NULL, "
         "event_canonical TEXT NOT NULL)"
     )
-    _db_instance.commit()
-
-
-def get_db() -> sqlite3.Connection:
-    """Get global database connection"""
-    if _db_instance is None:
-        init_db()
-    return _db_instance
+    conn.commit()
+    return conn
 
 
 def sha256_compact(data: list[str]) -> str:
-    """Compute SHA-256 of compact JSON array (preserves order)"""
+    """Compute SHA-256 of compact JSON array"""
     compact = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(compact.encode("utf-8", "strict")).hexdigest()
 
@@ -94,17 +78,18 @@ def compute_cache_key(node: str, inputs: dict[str, str], artifact_map: dict[str,
     """
     Compute cache key for a node.
     Returns None if parent artifacts are not available.
-    ORDER MATTERS: must match NODE_INPUTS order exactly.
+    artifact_map is current state: node -> artifact_digest or None
     """
     required = NODE_INPUTS[node]
     values = []
     
     for key in required:
+        # If key is a direct input, use it
         if key in inputs:
-            # Direct input
             values.append(inputs[key])
+        # If key is an artifact reference (ends with "Artifact"), resolve it
         elif key.endswith("Artifact"):
-            # Artifact reference: must be from a succeeded parent
+            # Extract parent node name (e.g., "prepareArtifact" -> "prepare")
             parent_node = key.replace("Artifact", "")
             artifact = artifact_map.get(parent_node)
             if artifact is None:
@@ -124,7 +109,7 @@ def compact_json(obj: Any) -> str:
 
 
 def is_safe_nonnegative_integer(x: Any) -> bool:
-    """Check if x is a safe non-negative integer (0 to 2^53-1)"""
+    """Check if x is a safe non-negative integer"""
     return isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 9007199254740991
 
 
@@ -134,7 +119,10 @@ def is_nonempty_string(x: Any) -> bool:
 
 
 def validate_event(event: Any) -> tuple[bool, Optional[str]]:
-    """Validate event structure"""
+    """
+    Validate event structure.
+    Returns (is_valid, error_code)
+    """
     if not isinstance(event, dict):
         return False, "INVALID_EVENT"
     
@@ -179,16 +167,6 @@ def validate_event(event: Any) -> tuple[bool, Optional[str]]:
     return True, None
 
 
-def is_parent_ready(node: str, session_state: SessionState) -> bool:
-    """Check if all parents of a node are succeeded"""
-    if node not in DAG_PARENTS:
-        return True
-    for parent in DAG_PARENTS[node]:
-        if session_state.nodes[parent].status != "succeeded":
-            return False
-    return True
-
-
 def process_event(
     session_state: SessionState,
     event: dict[str, Any],
@@ -209,7 +187,7 @@ def process_event(
     if event_revision != session_state.revision:
         return False, None
     
-    # Ignore if node doesn't exist
+    # Ignore if node doesn't exist (shouldn't happen if validated)
     if node not in DAG_NODES:
         return False, None
     
@@ -222,23 +200,23 @@ def process_event(
         return False, None
     
     # Get current node state
-    node_state = session_state.nodes[node]
+    node_state = session_state.nodes.get(node)
+    if node_state is None:
+        return False, None
+    
+    # Check parent availability (only for transitions that need it)
+    if node not in ["verify_data"]:
+        parent_keys = DAG_PARENTS[node]
+        for parent in parent_keys:
+            parent_state = session_state.nodes[parent]
+            if parent_state.status != "succeeded":
+                # Parent not available/successful
+                return False, None
+    
+    # State transition logic
     current_status = node_state.status
     current_attempt = node_state.attempt
     
-    # Parent availability check (critical for all transitions)
-    if not is_parent_ready(node, session_state):
-        # Ignore: parent not available
-        return False, None
-    
-    # Validate key matches expected cache key (only if we can compute it)
-    artifact_map = {n: session_state.nodes[n].artifact_digest for n in DAG_NODES}
-    expected_key = compute_cache_key(node, session_state.inputs, artifact_map)
-    if expected_key is not None and key != expected_key:
-        # Key mismatch: ignore
-        return False, None
-    
-    # State transition logic
     if status == "started":
         if attempt == 1 and current_status is None:
             # Accept: first start
@@ -258,7 +236,7 @@ def process_event(
             session_state.event_ids_seen.add(event_id)
             session_state.event_canonical[event_id] = event_canonical
             return True, None
-        elif attempt < current_attempt:
+        elif attempt < current_attempt and current_status not in ["none", None]:
             # Lower attempt: ignore
             return False, None
         else:
@@ -269,11 +247,10 @@ def process_event(
         if current_status == "started" and attempt == current_attempt:
             # Accept: completion of current attempt
             if status == "succeeded":
-                # Immutable evidence: bind artifact to key permanently
+                # Check for evidence conflict: different artifact for same key
                 if node_state.artifact_digest is not None and node_state.artifact_digest != artifact_digest:
                     return False, "EVIDENCE_CONFLICT"
                 node_state.artifact_digest = artifact_digest
-                node_state.cache_key = key  # Remember the cache key
                 node_state.receipt_id = event.get("receiptId")
             
             node_state.status = status
@@ -282,7 +259,7 @@ def process_event(
             session_state.event_canonical[event_id] = event_canonical
             return True, None
         elif current_status == "succeeded" and status == "succeeded":
-            # Already succeeded: check for evidence conflict
+            # Same success, different artifact
             if node_state.artifact_digest != artifact_digest:
                 return False, "EVIDENCE_CONFLICT"
             # Same artifact, same status: ignore (replay)
@@ -304,9 +281,9 @@ def process_event(
 
 
 def load_session(db: sqlite3.Connection, session: str) -> SessionState:
-    """Load session state from persistent database"""
+    """Load session state from database"""
     row = db.execute(
-        "SELECT revision, inputs, node_states, event_ids_seen, event_canonical FROM pipeline_sessions WHERE session = ?",
+        "SELECT revision, inputs, node_states, event_ids_seen, event_canonical FROM sessions WHERE session = ?",
         (session,),
     ).fetchone()
     
@@ -336,7 +313,6 @@ def load_session(db: sqlite3.Connection, session: str) -> SessionState:
                 artifact_digest=ns_raw.get("artifact_digest"),
                 event_id=ns_raw.get("event_id"),
                 receipt_id=ns_raw.get("receipt_id"),
-                cache_key=ns_raw.get("cache_key"),
             )
         
         state = SessionState(
@@ -352,7 +328,7 @@ def load_session(db: sqlite3.Connection, session: str) -> SessionState:
 
 
 def save_session(db: sqlite3.Connection, state: SessionState) -> None:
-    """Save session state to persistent database"""
+    """Save session state to database"""
     node_states_json = json.dumps({
         n: {
             "status": state.nodes[n].status,
@@ -360,7 +336,6 @@ def save_session(db: sqlite3.Connection, state: SessionState) -> None:
             "artifact_digest": state.nodes[n].artifact_digest,
             "event_id": state.nodes[n].event_id,
             "receipt_id": state.nodes[n].receipt_id,
-            "cache_key": state.nodes[n].cache_key,
         }
         for n in DAG_NODES
     }, separators=(",", ":"))
@@ -369,7 +344,7 @@ def save_session(db: sqlite3.Connection, state: SessionState) -> None:
     event_canonical_json = json.dumps(state.event_canonical, separators=(",", ":"))
     
     db.execute(
-        "INSERT OR REPLACE INTO pipeline_sessions (session, revision, inputs, node_states, event_ids_seen, event_canonical) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO sessions (session, revision, inputs, node_states, event_ids_seen, event_canonical) VALUES (?, ?, ?, ?, ?, ?)",
         (
             state.session,
             state.revision,
@@ -413,7 +388,9 @@ def validate_request(body: Any) -> tuple[bool, Optional[str]]:
 
 
 def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
-    """Process pipeline request with proper state management"""
+    """Process pipeline request"""
+    db = get_db()
+    
     # Validate request
     is_valid, error_code = validate_request(body)
     if not is_valid:
@@ -424,34 +401,43 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
     new_inputs = body["inputs"]
     events = body["events"]
     
-    db = get_db()
-    
     with DB_LOCK:
         # Load existing session
         session_state = load_session(db, session_str)
         
         # Check for revision conflict
         if session_state.revision != 0:  # Session exists
-            if new_revision <= session_state.revision:
-                # Invalid revision number: must be strictly increasing or same
+            if new_revision < session_state.revision:
+                # Cannot go backwards
                 return {"error": "REVISION_CONFLICT"}
             
-            if new_revision == session_state.revision + 1:
-                # New revision: validate inputs are different (if different revision expected)
-                # Replace inputs and clear attempt/terminal state, but KEEP succeeded artifacts
+            if new_revision == session_state.revision:
+                # Same revision: check inputs match exactly
+                if new_inputs != session_state.inputs:
+                    return {"error": "REVISION_CONFLICT"}
+                # Inputs match: reuse this revision's data (no state changes)
+            elif new_revision == session_state.revision + 1:
+                # New revision: replace inputs, clear event tracking, keep successful artifacts
                 session_state.revision = new_revision
                 session_state.inputs = new_inputs
-                # Clear non-terminal state
+                # Clear event IDs for new revision
+                session_state.event_ids_seen = set()
+                session_state.event_canonical = {}
+                # Reset all nodes but keep successful artifacts
                 for n in DAG_NODES:
                     old_state = session_state.nodes[n]
-                    if old_state.status == "succeeded":
-                        # Keep successful artifacts: they're immutable evidence
-                        pass
-                    else:
-                        # Clear all transient state
+                    if old_state.status != "succeeded":
                         session_state.nodes[n] = NodeState()
+                    else:
+                        # Keep artifact but clear transient state
+                        session_state.nodes[n] = NodeState(
+                            status="succeeded",
+                            artifact_digest=old_state.artifact_digest,
+                            event_id=old_state.event_id,
+                            receipt_id=old_state.receipt_id,
+                        )
             else:
-                # Revision jump > 1 is invalid
+                # Gap in revisions
                 return {"error": "REVISION_CONFLICT"}
         else:
             # New session
@@ -486,8 +472,6 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
     artifact_map = {n: session_state.nodes[n].artifact_digest for n in DAG_NODES}
     
     response_nodes = []
-    has_terminal_failure = False
-    
     for node in DAG_NODES:
         node_state = session_state.nodes[node]
         cache_key = compute_cache_key(node, session_state.inputs, artifact_map)
@@ -497,11 +481,7 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
         reason_codes = []
         triggering_event_ids = []
         
-        # Check if ancestor had terminal failure
-        if has_terminal_failure:
-            action = "block"
-            reason_codes = ["UPSTREAM_TERMINAL"]
-        elif node_state.status == "succeeded":
+        if node_state.status == "succeeded":
             action = "reuse"
             reason_codes = ["CACHE_HIT"]
             if node_state.event_id:
@@ -511,18 +491,13 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
             reason_codes = ["TERMINAL_FAILURE"]
             if node_state.event_id:
                 triggering_event_ids = [node_state.event_id]
-            has_terminal_failure = True
         elif node_state.status == "started":
             action = "block"
             reason_codes = ["RUNNING"]
             if node_state.event_id:
                 triggering_event_ids = [node_state.event_id]
-        elif not is_parent_ready(node, session_state):
-            # Parent not ready
-            action = "block"
-            reason_codes = ["UPSTREAM_PENDING"]
         elif cache_key is None:
-            # Can't compute cache key (shouldn't happen if parents ready)
+            # Parent not ready
             action = "block"
             reason_codes = ["UPSTREAM_PENDING"]
         else:
@@ -533,7 +508,7 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
             else:
                 reason_codes = ["RETRYABLE_FAILURE"]
         
-        # Build dependency digests (in NODE_INPUTS order)
+        # Build dependency digests - include ALL keys from NODE_INPUTS
         dependency_digests = {}
         required = NODE_INPUTS[node]
         for key in required:
@@ -542,10 +517,10 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
             elif key.endswith("Artifact"):
                 parent_node = key.replace("Artifact", "")
                 artifact = artifact_map.get(parent_node)
-                if artifact:
+                if artifact is not None:
                     dependency_digests[key] = artifact
         
-        if cache_key:
+        if cache_key is not None:
             dependency_digests["cacheKey"] = cache_key
         
         response_nodes.append({
@@ -562,7 +537,3 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
         "ignoredEventIds": ignored_event_ids,
         "nodes": response_nodes,
     }
-
-
-# Initialize database on module load
-init_db()
