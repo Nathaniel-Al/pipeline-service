@@ -11,6 +11,8 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app.pipeline import process_pipeline
+
 app = FastAPI()
 DB_PATH = os.environ.get("QUANTIZE_DB", "/tmp/quantize_state.sqlite3")
 DB_LOCK = threading.RLock()
@@ -491,6 +493,25 @@ async def quantize(request: Request):
         return JSONResponse(select(body, stored_response))
 
     return invalid_input()
+
+
+@app.post("/pipeline")
+async def pipeline(request: Request):
+    try:
+        raw = await request.body()
+        try:
+            body = json.loads(raw.decode("utf-8", "strict"))
+        except (UnicodeDecodeError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+            return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+    except Exception:
+        return JSONResponse({"error": "INVALID_REQUEST"}, status_code=400)
+
+    response = process_pipeline(body)
+    
+    if "error" in response:
+        return JSONResponse(response, status_code=409)
+    
+    return JSONResponse(response)
 
 
 def duplicate_check_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
