@@ -14,7 +14,6 @@ from fastapi.responses import JSONResponse
 from app.pipeline import process_pipeline
 
 app = FastAPI()
-#DB_PATH = os.environ.get("QUANTIZE_DB", "/tmp/quantize_state.sqlite3")
 DB_PATH = os.environ.get("QUANTIZE_DB", "./data/quantize_state.sqlite3")
 DB_LOCK = threading.RLock()
 
@@ -28,6 +27,11 @@ FREEZE_CODES = {
 
 
 def conn() -> sqlite3.Connection:
+    # Ensure data directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    
     c = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     c.execute(
         "CREATE TABLE IF NOT EXISTS freezes ("
