@@ -1,508 +1,505 @@
+from __future__ import annotations
+
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import threading
-from copy import deepcopy
+from typing import Any
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 app = FastAPI()
-DB_PATH = os.environ.get("PIPELINE_DB", "/data/pipeline.db")
-DB_DIR = os.path.dirname(DB_PATH) or "."
-os.makedirs(DB_DIR, exist_ok=True)
-LOCK = threading.RLock()
+DB_PATH = os.environ.get("QUANTIZE_DB", "/tmp/quantize_state.sqlite3")
+DB_LOCK = threading.RLock()
 
-DAG = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
-PARENT = {
-    "verify_data": None,
-    "prepare": "verify_data",
-    "train": "prepare",
-    "evaluate": "train",
-    "register": "evaluate",
-    "publish": "register",
+FREEZE_CODES = {
+    "INVALID_INPUT",
+    "UNALLOWED_UNSUPPORTED_REASON",
+    "NOT_LOADABLE",
+    "CALIBRATION_MISMATCH",
+    "TOKENIZER_MISMATCH",
 }
 
-# The order here is significant: it is the exact order required for each
-# content-addressed SHA-256 key.
-NODE_DEPS = {
-    "verify_data": ["generation", "checksum"],
-    "prepare": ["canonicalData", "prepareCode", "prepareConfig", "prepareArtifact"],
-    "train": ["prepareArtifact", "trainCode", "trainConfig", "runtime"],
-    "evaluate": ["trainArtifact", "canonicalData", "evaluateCode", "evaluateConfig"],
-    "register": ["evaluateArtifact", "schemaDigest"],
-    "publish": ["registerArtifact", "publishConfig"],
-}
 
-INPUT_KEYS = [
-    "generation", "checksum", "canonicalData", "prepareCode", "prepareConfig",
-    "trainCode", "trainConfig", "runtime", "evaluateCode", "evaluateConfig",
-    "schemaDigest", "publishConfig",
-]
-EVENT_FIELDS = [
-    "eventId", "revision", "node", "attempt", "status",
-    "key", "artifactDigest", "receiptId",
-]
-STATUSES = {"started", "succeeded", "retryable_failed", "terminal_failed"}
-RECEIPT_NODES = {"register", "publish"}
-SAFE_MAX = 9007199254740991
-
-
-def compact(obj):
-    return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
-
-
-def digest_array(values):
-    raw = json.dumps(values, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(raw).hexdigest()
-
-
-def is_safe_int(value):
-    return isinstance(value, int) and not isinstance(value, bool) and 0 < value <= SAFE_MAX
-
-
-def nonempty_str(value):
-    return isinstance(value, str) and len(value) > 0
-
-
-def error(code):
-    return JSONResponse(content={"error": code}, status_code=400)
-
-
-def conflict(code):
-    return JSONResponse(content={"error": code}, status_code=409)
-
-
-def init_db():
-    with sqlite3.connect(DB_PATH) as c:
-        c.execute("PRAGMA journal_mode=WAL")
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS sessions(
-                session TEXT PRIMARY KEY,
-                revision INTEGER NOT NULL,
-                inputs TEXT NOT NULL,
-                state TEXT NOT NULL
-            )
-        """)
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS events(
-                session TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                canonical TEXT NOT NULL,
-                PRIMARY KEY(session, event_id)
-            )
-        """)
-        # Cache is isolated by session.  Within a session it survives
-        # revision changes and binds a successful content-addressed key to
-        # its first artifact/event evidence permanently.
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS cache(
-                session TEXT NOT NULL,
-                node TEXT NOT NULL,
-                cache_key TEXT NOT NULL,
-                artifact_digest TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                PRIMARY KEY(session, node, cache_key)
-            )
-        """)
-        c.commit()
-
-
-init_db()
-
-
-def load_session(c, session):
-    row = c.execute(
-        "SELECT revision, inputs, state FROM sessions WHERE session=?", (session,)
-    ).fetchone()
-    if row is None:
-        return None
-    return {
-        "revision": row[0],
-        "inputs": json.loads(row[1]),
-        "state": json.loads(row[2]),
-    }
-
-
-def save_session(c, session, data):
+def conn() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     c.execute(
-        "UPDATE sessions SET revision=?, inputs=?, state=? WHERE session=?",
-        (
-            data["revision"],
-            compact(data["inputs"]),
-            compact(data["state"]),
-            session,
-        ),
+        "CREATE TABLE IF NOT EXISTS freezes ("
+        "freeze_id TEXT PRIMARY KEY, request_json TEXT NOT NULL, response_json TEXT NOT NULL)"
+    )
+    c.commit()
+    return c
+
+
+DB = conn()
+
+
+def invalid_input() -> JSONResponse:
+    return JSONResponse({"error": "INVALID_INPUT"}, status_code=400)
+
+
+def conflict() -> JSONResponse:
+    return JSONResponse({"error": "FREEZE_ID_CONFLICT"}, status_code=409)
+
+
+def utf8(s: str) -> bytes:
+    return s.encode("utf-8", "strict")
+
+
+def compact_json(value: Any) -> bytes:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8", "strict")
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def code_list(codes: set[str] | list[str]) -> list[str]:
+    return sorted(set(codes), key=utf8)
+
+
+def nonempty_string(x: Any) -> bool:
+    return isinstance(x, str) and len(x) > 0
+
+
+def unique_strings(x: Any) -> bool:
+    return (
+        isinstance(x, list)
+        and all(nonempty_string(v) for v in x)
+        and len(x) == len(set(x))
     )
 
 
-def cache_get(c, session, node, key):
-    if key is None:
-        return None
-    row = c.execute(
-        "SELECT artifact_digest, event_id FROM cache "
-        "WHERE session=? AND node=? AND cache_key=?",
-        (session, node, key),
-    ).fetchone()
-    if row is None:
-        return None
-    return {"artifactDigest": row[0], "eventId": row[1]}
+def finite_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(float(x))
 
 
-def cache_put(c, session, node, key, artifact, event_id):
-    c.execute(
-        "INSERT INTO cache(session,node,cache_key,artifact_digest,event_id) "
-        "VALUES(?,?,?,?,?)",
-        (session, node, key, artifact, event_id),
-    )
+def safe_nonnegative_integer(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 9007199254740991
 
 
-def valid_inputs(inputs):
-    return isinstance(inputs, dict) and all(
-        nonempty_str(inputs.get(k)) for k in INPUT_KEYS
-    )
+def binary(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool) and (x == 0 or x == 1)
 
 
-def event_valid_shape(event):
-    # Events with invalid shape/content are ignored, not request-level errors.
-    if not isinstance(event, dict):
+def round12(x: float) -> float:
+    return round(x, 12)
+
+
+def validate_files(files: Any) -> tuple[bool, list[dict[str, Any]], int | None, str | None]:
+    if not isinstance(files, dict) or len(files) == 0:
+        return False, [], None, None
+
+    inventory: list[dict[str, Any]] = []
+    for filename, text in files.items():
+        if not isinstance(filename, str) or not isinstance(text, str):
+            return False, [], None, None
+        try:
+            raw = text.encode("utf-8", "strict")
+        except UnicodeEncodeError:
+            return False, [], None, None
+        inventory.append(
+            {
+                "name": filename,
+                "bytes": len(raw),
+                "sha256": sha256(raw),
+            }
+        )
+
+    inventory.sort(key=lambda x: utf8(x["name"]))
+    total = sum(x["bytes"] for x in inventory)
+    package = sha256(compact_json(inventory))
+    return True, inventory, total, package
+
+
+def freeze_valid(body: Any) -> bool:
+    if not isinstance(body, dict) or body.get("phase") != "freeze":
         return False
-    if set(event.keys()) != set(EVENT_FIELDS):
+    if not isinstance(body.get("freezeId"), str) or not (1 <= len(body["freezeId"]) <= 128):
         return False
-    if not all(k in event for k in EVENT_FIELDS):
+    if not nonempty_string(body.get("calibrationDigest")):
         return False
-    if not nonempty_str(event["eventId"]):
+    if not nonempty_string(body.get("tokenizerDigest")):
         return False
-    if not is_safe_int(event["revision"]):
-        return False
-    if event["node"] not in DAG:
-        return False
-    if not is_safe_int(event["attempt"]):
-        return False
-    if event["status"] not in STATUSES:
-        return False
-    if not nonempty_str(event["key"]):
+    if not unique_strings(body.get("allowedUnsupportedReasons")):
         return False
 
-    if event["status"] == "succeeded":
-        if not nonempty_str(event["artifactDigest"]):
+    candidates = body.get("candidates")
+    if not isinstance(candidates, list) or len(candidates) == 0:
+        return False
+
+    names: list[str] = []
+    for c in candidates:
+        if not isinstance(c, dict):
             return False
-    elif event["artifactDigest"] is not None:
-        return False
-
-    if event["node"] in RECEIPT_NODES:
-        if event["status"] == "succeeded":
-            if event["receiptId"] != f"receipt:{event['node']}:{event['key']}":
-                return False
-        elif event["receiptId"] is not None:
+        if not nonempty_string(c.get("name")):
             return False
-    elif event["receiptId"] is not None:
-        return False
-
-    return True
-
-
-def state_for_current_key(state, node, key):
-    current = state.get(node)
-    if current is None or current.get("key") != key:
-        return {
-            "status": None,
-            "attempt": None,
-            "eventId": None,
-            "artifactDigest": None,
-            "key": key,
-        }
-    return current
-
-
-def dependency_values(node, inputs, reusable):
-    # The dict insertion order follows NODE_DEPS exactly.
-    if node == "verify_data":
-        return {
-            "generation": inputs["generation"],
-            "checksum": inputs["checksum"],
-        }
-    if node == "prepare":
-        return {
-            "canonicalData": inputs["canonicalData"],
-            "prepareCode": inputs["prepareCode"],
-            "prepareConfig": inputs["prepareConfig"],
-            "prepareArtifact": reusable["verify_data"]["artifactDigest"],
-        }
-    if node == "train":
-        return {
-            "prepareArtifact": reusable["prepare"]["artifactDigest"],
-            "trainCode": inputs["trainCode"],
-            "trainConfig": inputs["trainConfig"],
-            "runtime": inputs["runtime"],
-        }
-    if node == "evaluate":
-        return {
-            "trainArtifact": reusable["train"]["artifactDigest"],
-            "canonicalData": inputs["canonicalData"],
-            "evaluateCode": inputs["evaluateCode"],
-            "evaluateConfig": inputs["evaluateConfig"],
-        }
-    if node == "register":
-        return {
-            "evaluateArtifact": reusable["evaluate"]["artifactDigest"],
-            "schemaDigest": inputs["schemaDigest"],
-        }
-    return {
-        "registerArtifact": reusable["register"]["artifactDigest"],
-        "publishConfig": inputs["publishConfig"],
-    }
-
-
-def compute_keys(c, session, inputs):
-    """Walk the DAG and only create a downstream key after its parent is reusable."""
-    keys = {}
-    reusable = {}
-    for node in DAG:
-        parent = PARENT[node]
-        if parent is not None and parent not in reusable:
-            keys[node] = None
+        names.append(c["name"])
+        if "files" not in c or not isinstance(c["files"], dict):
+            # This is candidate-level invalid file data, not a whole-request
+            # shape error. build_freeze() will emit empty manifest fields.
             continue
+        if "loadable" not in c or not isinstance(c["loadable"], bool):
+            return False
+        if not nonempty_string(c.get("calibrationDigest")):
+            return False
+        if not nonempty_string(c.get("tokenizerDigest")):
+            return False
+        if "unsupportedReason" in c and not nonempty_string(c["unsupportedReason"]):
+            return False
 
-        vals = dependency_values(node, inputs, reusable)
-        keys[node] = digest_array([vals[name] for name in NODE_DEPS[node]])
-        hit = cache_get(c, session, node, keys[node])
-        if hit is not None:
-            reusable[node] = hit
-    return keys, reusable
-
-
-def transition(current, event):
-    prev = current["status"]
-    if prev is None:
-        return "accept" if event["status"] == "started" and event["attempt"] == 1 else "ignore"
-
-    if prev == "started":
-        if event["attempt"] == current["attempt"] and event["status"] in {
-            "succeeded", "retryable_failed", "terminal_failed"
-        }:
-            return "accept"
-        return "conflict"
-
-    if prev == "retryable_failed":
-        if event["status"] == "started" and event["attempt"] == current["attempt"] + 1:
-            return "accept"
-        return "conflict"
-
-    if prev == "terminal_failed":
-        return "conflict"
-
-    if prev == "succeeded":
-        if event["status"] == "succeeded" and event["artifactDigest"] != current["artifactDigest"]:
-            return "evidence"
-        return "conflict"
-
-    return "conflict"
+    return len(names) == len(set(names))
 
 
-def set_state(state, node, event):
-    state[node] = {
-        "status": event["status"],
-        "attempt": event["attempt"],
-        "eventId": event["eventId"],
-        "artifactDigest": event["artifactDigest"],
-        "key": event["key"],
+def build_freeze(body: dict[str, Any]) -> dict[str, Any]:
+    allowed = set(body["allowedUnsupportedReasons"])
+    result: list[dict[str, Any]] = []
+
+    for c in body["candidates"]:
+        file_ok, inventory, total, package = validate_files(c.get("files"))
+        reasons: set[str] = set()
+        unsupported_reason = c.get("unsupportedReason")
+
+        if not file_ok:
+            reasons.add("INVALID_INPUT")
+            status = "invalid"
+            inventory = []
+            total = None
+            package = None
+        elif unsupported_reason is not None and unsupported_reason in allowed:
+            status = "unsupported"
+        else:
+            status = "frozen"
+            if unsupported_reason is not None:
+                reasons.add("UNALLOWED_UNSUPPORTED_REASON")
+            if not c.get("loadable", False):
+                reasons.add("NOT_LOADABLE")
+            if c.get("calibrationDigest") != body["calibrationDigest"]:
+                reasons.add("CALIBRATION_MISMATCH")
+            if c.get("tokenizerDigest") != body["tokenizerDigest"]:
+                reasons.add("TOKENIZER_MISMATCH")
+            if reasons:
+                status = "invalid"
+
+        result.append(
+            {
+                "name": c["name"],
+                "status": status,
+                "inventory": inventory,
+                "totalBytes": total,
+                "packageDigest": package,
+                "reasonCodes": code_list(reasons),
+            }
+        )
+
+    result.sort(key=lambda x: utf8(x["name"]))
+    return {"freezeId": body["freezeId"], "candidates": result}
+
+
+def stored(freeze_id: str) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    row = DB.execute(
+        "SELECT request_json, response_json FROM freezes WHERE freeze_id = ?",
+        (freeze_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return json.loads(row[0]), json.loads(row[1])
+
+
+def select_shape(body: Any) -> bool:
+    return (
+        isinstance(body, dict)
+        and body.get("phase") == "select"
+        and isinstance(body.get("freezeId"), str)
+        and len(body["freezeId"]) > 0
+        and isinstance(body.get("candidates"), list)
+        and isinstance(body.get("rows"), list)
+        and isinstance(body.get("policy"), dict)
+    )
+
+
+def validate_policy(policy: Any) -> bool:
+    if not isinstance(policy, dict):
+        return False
+    required = ("maxBytes", "aggregateFloor", "requiredSlices", "maxLatencyMs", "candidateOrder")
+    if any(k not in policy for k in required):
+        return False
+    if not safe_nonnegative_integer(policy["maxBytes"]):
+        return False
+    if not finite_number(policy["aggregateFloor"]) or not 0 <= float(policy["aggregateFloor"]) <= 1:
+        return False
+    if not finite_number(policy["maxLatencyMs"]) or float(policy["maxLatencyMs"]) < 0:
+        return False
+    if not isinstance(policy["requiredSlices"], dict):
+        return False
+    for name, floor in policy["requiredSlices"].items():
+        if not nonempty_string(name):
+            return False
+        if not finite_number(floor) or not 0 <= float(floor) <= 1:
+            return False
+    return unique_strings(policy["candidateOrder"])
+
+
+def manifest_valid(c: Any) -> tuple[bool, int | None, str | None]:
+    if not isinstance(c, dict) or not isinstance(c.get("inventory"), list):
+        return False, None, None
+
+    inv = c["inventory"]
+    names: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    for item in inv:
+        if not isinstance(item, dict) or list(item.keys()) != ["name", "bytes", "sha256"]:
+            return False, None, None
+        if not nonempty_string(item["name"]):
+            return False, None, None
+        if not safe_nonnegative_integer(item["bytes"]):
+            return False, None, None
+        digest = item["sha256"]
+        if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+            return False, None, None
+        names.append(item["name"])
+        normalized.append(
+            {"name": item["name"], "bytes": item["bytes"], "sha256": digest}
+        )
+
+    if len(names) != len(set(names)):
+        return False, None, None
+    if normalized != sorted(normalized, key=lambda x: utf8(x["name"])):
+        return False, None, None
+
+    total = sum(x["bytes"] for x in normalized)
+    digest = sha256(compact_json(normalized))
+    if c.get("totalBytes") != total or c.get("packageDigest") != digest:
+        return False, None, None
+    return True, total, digest
+
+
+def latency(latencies: Any, name: str) -> tuple[bool, float | int | None]:
+    if not isinstance(latencies, dict) or name not in latencies:
+        return False, None
+    value = latencies[name]
+    if not finite_number(value) or float(value) < 0:
+        return False, None
+    return True, value
+
+
+def select(body: dict[str, Any], stored_response: dict[str, Any]) -> dict[str, Any]:
+    stored_candidates = stored_response.get("candidates", [])
+    submitted = body["candidates"]
+    policy = body["policy"]
+    rows = body["rows"]
+    latencies = body.get("latencies")
+
+    global_codes: set[str] = set()
+    policy_ok = validate_policy(policy)
+    if not policy_ok:
+        global_codes.add("INVALID_POLICY")
+
+    stored_names = [c.get("name") for c in stored_candidates if isinstance(c, dict)]
+    submitted_names = [c.get("name") if isinstance(c, dict) else None for c in submitted]
+    order = policy.get("candidateOrder") if isinstance(policy, dict) else []
+
+    if (
+        not unique_strings(order)
+        or set(order) != set(stored_names)
+        or set(order) != set(x for x in submitted_names if isinstance(x, str))
+        or len(submitted_names) != len(stored_names)
+        or len([x for x in submitted_names if isinstance(x, str)]) != len(submitted_names)
+    ):
+        global_codes.add("INVALID_POLICY")
+
+    stored_by_name = {c["name"]: c for c in stored_candidates if isinstance(c, dict) and "name" in c}
+    submitted_by_name = {c["name"]: c for c in submitted if isinstance(c, dict) and "name" in c}
+
+    # Results use candidateOrder. UTF-8 name is the deterministic fallback.
+    names = list(stored_by_name.keys())
+    names.sort(key=lambda n: (order.index(n) if n in order else len(order), utf8(n)))
+
+    results: list[dict[str, Any]] = []
+    required_slices = policy.get("requiredSlices", {}) if policy_ok else {}
+
+    for name in names:
+        c = stored_by_name[name]
+        reasons = set(c.get("reasonCodes", []))
+
+        if submitted_by_name.get(name) != c:
+            reasons.add("INVALID_LINEAGE")
+
+        manifest_ok, total_bytes, _ = manifest_valid(c)
+        if not manifest_ok:
+            reasons.add("INVALID_MANIFEST")
+            total_bytes = None
+
+        if c.get("status") != "frozen":
+            reasons.add("NOT_FROZEN")
+
+        aggregate = None
+        slices: dict[str, Any] = {}
+        predictions_ok = True
+        values: list[tuple[str, Any, Any]] = []
+
+        if not isinstance(rows, list):
+            predictions_ok = False
+        else:
+            for row in rows:
+                if not isinstance(row, dict):
+                    predictions_ok = False
+                    break
+                if "label" not in row or "slice" not in row or "predictions" not in row:
+                    predictions_ok = False
+                    break
+                if not binary(row["label"]) or not isinstance(row["slice"], str) or not isinstance(row["predictions"], dict):
+                    predictions_ok = False
+                    break
+                if name not in row["predictions"] or not binary(row["predictions"][name]):
+                    predictions_ok = False
+                    break
+                values.append((row["slice"], row["label"], row["predictions"][name]))
+
+        if not predictions_ok:
+            reasons.add("INVALID_PREDICTIONS")
+        elif values:
+            aggregate = round12(sum(1 for _, y, p in values if y == p) / len(values))
+            for slice_name in sorted(required_slices.keys(), key=utf8):
+                subset = [(y, p) for s, y, p in values if s == slice_name]
+                if not subset:
+                    slices[slice_name] = None
+                    reasons.add(f"MISSING_SLICE:{slice_name}")
+                else:
+                    acc = round12(sum(1 for y, p in subset if y == p) / len(subset))
+                    slices[slice_name] = acc
+                    if acc < float(required_slices[slice_name]):
+                        reasons.add(f"SLICE_FLOOR:{slice_name}")
+        else:
+            # Empty rows cannot satisfy an aggregate floor.
+            reasons.add("AGGREGATE_FLOOR")
+            for slice_name in sorted(required_slices.keys(), key=utf8):
+                slices[slice_name] = None
+                reasons.add(f"MISSING_SLICE:{slice_name}")
+
+        if policy_ok:
+            if aggregate is None or aggregate < float(policy["aggregateFloor"]):
+                reasons.add("AGGREGATE_FLOOR")
+
+        latency_ok, latency_value = latency(latencies, name)
+        if not latency_ok:
+            reasons.add("LATENCY_LIMIT")
+            latency_value = None
+        elif policy_ok and float(latency_value) > float(policy["maxLatencyMs"]):
+            reasons.add("LATENCY_LIMIT")
+
+        if policy_ok:
+            if total_bytes is None or total_bytes > policy["maxBytes"]:
+                reasons.add("SIZE_LIMIT")
+
+        if global_codes:
+            reasons.update(global_codes)
+
+        results.append(
+            {
+                "name": name,
+                "aggregate": aggregate,
+                "slices": slices,
+                "totalBytes": total_bytes,
+                "latencyMs": latency_value,
+                "admitted": len(reasons) == 0,
+                "reasonCodes": code_list(reasons),
+            }
+        )
+
+    admitted = [r for r in results if r["admitted"]]
+    winner = None
+    if admitted:
+        positions = {name: i for i, name in enumerate(order)}
+        winner = min(
+            admitted,
+            key=lambda r: (
+                r["totalBytes"],
+                float(r["latencyMs"]),
+                positions.get(r["name"], len(order)),
+                utf8(r["name"]),
+            ),
+        )
+
+    return {
+        "freezeId": body["freezeId"],
+        "selected": winner["name"] if winner else None,
+        "results": results,
+        "packageManifest": stored_by_name[winner["name"]] if winner else None,
     }
 
 
-@app.post("/pipeline")
-async def pipeline(request: Request):
+@app.post("/quantize")
+async def quantize(request: Request):
     try:
-        body = await request.json()
+        raw = await request.body()
+        try:
+            body = json.loads(
+                raw.decode("utf-8", "strict"),
+                object_pairs_hook=lambda pairs: duplicate_check_object(pairs),
+            )
+        except (UnicodeDecodeError, UnicodeError, json.JSONDecodeError, ValueError, TypeError):
+            return invalid_input()
     except Exception:
-        return error("INVALID_REQUEST")
+        return invalid_input()
 
-    if not isinstance(body, dict) or set(body.keys()) != {"session", "revision", "inputs", "events"}:
-        return error("INVALID_REQUEST")
+    if not isinstance(body, dict):
+        return invalid_input()
 
-    session = body["session"]
-    revision = body["revision"]
-    inputs = body["inputs"]
-    events = body["events"]
+    phase = body.get("phase")
+    if phase == "freeze":
+        if not freeze_valid(body):
+            return invalid_input()
+        freeze_id = body["freezeId"]
+        with DB_LOCK:
+            existing = stored(freeze_id)
+            if existing is not None:
+                old_request, old_response = existing
+                if old_request == body:
+                    return JSONResponse(old_response)
+                return conflict()
 
-    if not nonempty_str(session) or not is_safe_int(revision) or not valid_inputs(inputs) or not isinstance(events, list):
-        return error("INVALID_REQUEST")
-
-    with LOCK, sqlite3.connect(DB_PATH) as c:
-        c.execute("BEGIN IMMEDIATE")
-        s = load_session(c, session)
-
-        if s is None:
-            s = {"revision": revision, "inputs": deepcopy(inputs), "state": {}}
-            c.execute(
-                "INSERT INTO sessions(session,revision,inputs,state) VALUES(?,?,?,?)",
-                (session, revision, compact(inputs), compact({})),
+            response = build_freeze(body)
+            DB.execute(
+                "INSERT INTO freezes(freeze_id, request_json, response_json) VALUES (?, ?, ?)",
+                (
+                    freeze_id,
+                    json.dumps(body, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+                    json.dumps(response, ensure_ascii=False, separators=(",", ":"), allow_nan=False),
+                ),
             )
-        elif revision != s["revision"]:
-            # Revision changes replace the active inputs and terminal/attempt
-            # state. Successful content-addressed cache entries are retained.
-            s = {"revision": revision, "inputs": deepcopy(inputs), "state": {}}
-            save_session(c, session, s)
-        elif compact(inputs) != compact(s["inputs"]):
-            c.rollback()
-            return conflict("REVISION_CONFLICT")
+            DB.commit()
+            return JSONResponse(response)
 
-        working = deepcopy(s["state"])
-        accepted = []
-        ignored = []
-        batch_ids = {}
+    if phase == "select":
+        if not select_shape(body):
+            return invalid_input()
+        with DB_LOCK:
+            existing = stored(body["freezeId"])
+        if existing is None:
+            stored_response = {"freezeId": body["freezeId"], "candidates": []}
+        else:
+            _, stored_response = existing
+        return JSONResponse(select(body, stored_response))
 
-        for event in events:
-            eid = event.get("eventId") if isinstance(event, dict) else None
+    return invalid_input()
 
-            if not event_valid_shape(event):
-                if nonempty_str(eid):
-                    ignored.append(eid)
-                continue
 
-            canonical = compact(event)
-
-            # Duplicate IDs in this request are compared against their first
-            # occurrence. A replay is ignored; a changed payload is atomic 409.
-            if eid in batch_ids:
-                if batch_ids[eid] != canonical:
-                    c.rollback()
-                    return conflict("EVENT_ID_CONFLICT")
-                ignored.append(eid)
-                continue
-            batch_ids[eid] = canonical
-
-            prior = c.execute(
-                "SELECT canonical FROM events WHERE session=? AND event_id=?",
-                (session, eid),
-            ).fetchone()
-            if prior is not None:
-                if prior[0] == canonical:
-                    ignored.append(eid)
-                    continue
-                c.rollback()
-                return conflict("EVENT_ID_CONFLICT")
-
-            # Wrong revision, wrong key, unavailable parent, etc. are ignored
-            # and do not reserve the event ID.
-            if event["revision"] != revision:
-                ignored.append(eid)
-                continue
-
-            keys, reusable = compute_keys(c, session, inputs)
-            expected_key = keys.get(event["node"])
-            if expected_key is None or event["key"] != expected_key:
-                ignored.append(eid)
-                continue
-
-            # A successful cache entry is immutable evidence, even if it came
-            # from an earlier revision in this same session.
-            cached = cache_get(c, session, event["node"], expected_key)
-            if cached is not None:
-                if event["status"] == "succeeded" and event["artifactDigest"] != cached["artifactDigest"]:
-                    c.rollback()
-                    return conflict("EVIDENCE_CONFLICT")
-                c.rollback() if False else None
-                # Any new event against an already-successful current cache is
-                # a status conflict, except the differing-artifact evidence
-                # case handled above.
-                c.rollback()
-                return conflict("STATUS_CONFLICT")
-
-            parent = PARENT[event["node"]]
-            if parent is not None and parent not in reusable:
-                ignored.append(eid)
-                continue
-
-            current = state_for_current_key(working, event["node"], expected_key)
-            tr = transition(current, event)
-            if tr == "ignore":
-                ignored.append(eid)
-                continue
-            if tr == "evidence":
-                c.rollback()
-                return conflict("EVIDENCE_CONFLICT")
-            if tr == "conflict":
-                c.rollback()
-                return conflict("STATUS_CONFLICT")
-
-            set_state(working, event["node"], event)
-            c.execute(
-                "INSERT INTO events(session,event_id,revision,canonical) VALUES(?,?,?,?)",
-                (session, eid, revision, canonical),
-            )
-
-            if event["status"] == "succeeded":
-                cache_put(c, session, event["node"], expected_key, event["artifactDigest"], eid)
-
-            accepted.append(eid)
-
-        s["state"] = working
-        save_session(c, session, s)
-        c.commit()
-
-        # Read the committed state back and construct deterministic response.
-        with sqlite3.connect(DB_PATH) as rc:
-            keys, reusable = compute_keys(rc, session, inputs)
-            nodes = []
-
-            for node in DAG:
-                key = keys[node]
-                deps = {}
-                if key is not None:
-                    vals = dependency_values(node, inputs, reusable)
-                    for dep_name in NODE_DEPS[node]:
-                        deps[dep_name] = vals[dep_name]
-                    deps["cacheKey"] = key
-
-                cur = state_for_current_key(working, node, key)
-                hit = cache_get(rc, session, node, key)
-
-                if hit is not None:
-                    action = "reuse"
-                    reason = "CACHE_HIT"
-                    triggers = [hit["eventId"]]
-                elif cur["status"] == "terminal_failed":
-                    action = "block"
-                    reason = "TERMINAL_FAILURE"
-                    triggers = [cur["eventId"]]
-                elif cur["status"] == "started":
-                    action = "block"
-                    reason = "RUNNING"
-                    triggers = [cur["eventId"]]
-                elif cur["status"] == "retryable_failed":
-                    action = "rerun"
-                    reason = "RETRYABLE_FAILURE"
-                    triggers = [cur["eventId"]]
-                elif key is None:
-                    parent = PARENT[node]
-                    if parent is not None and state_for_current_key(working, parent, keys.get(parent)).get("status") == "terminal_failed":
-                        action = "block"
-                        reason = "UPSTREAM_TERMINAL"
-                    else:
-                        action = "block"
-                        reason = "UPSTREAM_PENDING"
-                    triggers = []
-                else:
-                    action = "rerun"
-                    reason = "CACHE_MISS"
-                    triggers = []
-
-                nodes.append({
-                    "node": node,
-                    "action": action,
-                    "reasonCodes": [reason],
-                    "dependencyDigests": deps,
-                    "triggeringEventIds": triggers,
-                })
-
-        return {
-            "revision": revision,
-            "acceptedEventIds": accepted,
-            "ignoredEventIds": ignored,
-            "nodes": nodes,
-        }
+def duplicate_check_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError("duplicate JSON object key")
+        out[key] = value
+    return out
 
 
 @app.get("/health")
