@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sqlite3
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from typing import Any, Optional
 
+# Global database connection and lock
 DB_LOCK = threading.RLock()
+DB_PATH = os.environ.get("PIPELINE_DB", "./data/pipeline_state.sqlite3")
+_db_instance = None
 
 # DAG structure: fixed ordering with dependencies
 DAG_NODES = ["verify_data", "prepare", "train", "evaluate", "register", "publish"]
@@ -20,7 +24,7 @@ DAG_PARENTS = {
     "publish": ["register"],
 }
 
-# Inputs required for each node's cache key
+# Inputs required for each node's cache key (ORDER MATTERS)
 NODE_INPUTS = {
     "verify_data": ["generation", "checksum"],
     "prepare": ["canonicalData", "prepareCode", "prepareConfig"],
@@ -37,8 +41,9 @@ class NodeState:
     status: Optional[str] = None  # None, "started", "succeeded", "retryable_failed", "terminal_failed"
     attempt: int = 0
     artifact_digest: Optional[str] = None
-    event_id: Optional[str] = None  # The event ID that produced this state
+    event_id: Optional[str] = None
     receipt_id: Optional[str] = None
+    cache_key: Optional[str] = None  # Immutable cache key once succeeded
 
 
 @dataclass
@@ -48,15 +53,20 @@ class SessionState:
     revision: int
     inputs: dict[str, str]
     nodes: dict[str, NodeState]
-    event_ids_seen: set[str]  # All event IDs processed in this session
-    event_canonical: dict[str, str]  # event_id -> compact JSON for replay detection
+    event_ids_seen: set[str]
+    event_canonical: dict[str, str]
 
 
-def get_db() -> sqlite3.Connection:
-    """Get database connection"""
-    conn = sqlite3.connect(":memory:", check_same_thread=False)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS sessions ("
+def init_db() -> None:
+    """Initialize database with persistent storage"""
+    global _db_instance
+    db_dir = os.path.dirname(DB_PATH)
+    if db_dir and not os.path.exists(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+    
+    _db_instance = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    _db_instance.execute(
+        "CREATE TABLE IF NOT EXISTS pipeline_sessions ("
         "session TEXT PRIMARY KEY, "
         "revision INTEGER NOT NULL, "
         "inputs TEXT NOT NULL, "
@@ -64,12 +74,18 @@ def get_db() -> sqlite3.Connection:
         "event_ids_seen TEXT NOT NULL, "
         "event_canonical TEXT NOT NULL)"
     )
-    conn.commit()
-    return conn
+    _db_instance.commit()
+
+
+def get_db() -> sqlite3.Connection:
+    """Get global database connection"""
+    if _db_instance is None:
+        init_db()
+    return _db_instance
 
 
 def sha256_compact(data: list[str]) -> str:
-    """Compute SHA-256 of compact JSON array"""
+    """Compute SHA-256 of compact JSON array (preserves order)"""
     compact = json.dumps(data, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(compact.encode("utf-8", "strict")).hexdigest()
 
@@ -78,18 +94,17 @@ def compute_cache_key(node: str, inputs: dict[str, str], artifact_map: dict[str,
     """
     Compute cache key for a node.
     Returns None if parent artifacts are not available.
-    artifact_map is current state: node -> artifact_digest or None
+    ORDER MATTERS: must match NODE_INPUTS order exactly.
     """
     required = NODE_INPUTS[node]
     values = []
     
     for key in required:
-        # If key is a direct input, use it
         if key in inputs:
+            # Direct input
             values.append(inputs[key])
-        # If key is an artifact reference (ends with "Artifact"), resolve it
         elif key.endswith("Artifact"):
-            # Extract parent node name (e.g., "prepareArtifact" -> "prepare")
+            # Artifact reference: must be from a succeeded parent
             parent_node = key.replace("Artifact", "")
             artifact = artifact_map.get(parent_node)
             if artifact is None:
@@ -109,7 +124,7 @@ def compact_json(obj: Any) -> str:
 
 
 def is_safe_nonnegative_integer(x: Any) -> bool:
-    """Check if x is a safe non-negative integer"""
+    """Check if x is a safe non-negative integer (0 to 2^53-1)"""
     return isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 9007199254740991
 
 
@@ -119,10 +134,7 @@ def is_nonempty_string(x: Any) -> bool:
 
 
 def validate_event(event: Any) -> tuple[bool, Optional[str]]:
-    """
-    Validate event structure.
-    Returns (is_valid, error_code)
-    """
+    """Validate event structure"""
     if not isinstance(event, dict):
         return False, "INVALID_EVENT"
     
@@ -167,10 +179,19 @@ def validate_event(event: Any) -> tuple[bool, Optional[str]]:
     return True, None
 
 
+def is_parent_ready(node: str, session_state: SessionState) -> bool:
+    """Check if all parents of a node are succeeded"""
+    if node not in DAG_PARENTS:
+        return True
+    for parent in DAG_PARENTS[node]:
+        if session_state.nodes[parent].status != "succeeded":
+            return False
+    return True
+
+
 def process_event(
     session_state: SessionState,
     event: dict[str, Any],
-    current_request_revision: int,
 ) -> tuple[bool, Optional[str]]:
     """
     Process a single event for the session.
@@ -188,7 +209,7 @@ def process_event(
     if event_revision != session_state.revision:
         return False, None
     
-    # Ignore if node doesn't exist (shouldn't happen if validated)
+    # Ignore if node doesn't exist
     if node not in DAG_NODES:
         return False, None
     
@@ -201,23 +222,23 @@ def process_event(
         return False, None
     
     # Get current node state
-    node_state = session_state.nodes.get(node)
-    if node_state is None:
-        return False, None
-    
-    # Check parent availability (only for transitions that need it)
-    if node not in ["verify_data"]:
-        parent_keys = DAG_PARENTS[node]
-        for parent in parent_keys:
-            parent_state = session_state.nodes[parent]
-            if parent_state.status != "succeeded":
-                # Parent not available/successful
-                return False, None
-    
-    # State transition logic
+    node_state = session_state.nodes[node]
     current_status = node_state.status
     current_attempt = node_state.attempt
     
+    # Parent availability check (critical for all transitions)
+    if not is_parent_ready(node, session_state):
+        # Ignore: parent not available
+        return False, None
+    
+    # Validate key matches expected cache key (only if we can compute it)
+    artifact_map = {n: session_state.nodes[n].artifact_digest for n in DAG_NODES}
+    expected_key = compute_cache_key(node, session_state.inputs, artifact_map)
+    if expected_key is not None and key != expected_key:
+        # Key mismatch: ignore
+        return False, None
+    
+    # State transition logic
     if status == "started":
         if attempt == 1 and current_status is None:
             # Accept: first start
@@ -237,7 +258,7 @@ def process_event(
             session_state.event_ids_seen.add(event_id)
             session_state.event_canonical[event_id] = event_canonical
             return True, None
-        elif attempt < current_attempt and current_status not in ["none", None]:
+        elif attempt < current_attempt:
             # Lower attempt: ignore
             return False, None
         else:
@@ -248,10 +269,11 @@ def process_event(
         if current_status == "started" and attempt == current_attempt:
             # Accept: completion of current attempt
             if status == "succeeded":
-                # Check for evidence conflict: different artifact for same key
+                # Immutable evidence: bind artifact to key permanently
                 if node_state.artifact_digest is not None and node_state.artifact_digest != artifact_digest:
                     return False, "EVIDENCE_CONFLICT"
                 node_state.artifact_digest = artifact_digest
+                node_state.cache_key = key  # Remember the cache key
                 node_state.receipt_id = event.get("receiptId")
             
             node_state.status = status
@@ -260,7 +282,7 @@ def process_event(
             session_state.event_canonical[event_id] = event_canonical
             return True, None
         elif current_status == "succeeded" and status == "succeeded":
-            # Same success, different artifact
+            # Already succeeded: check for evidence conflict
             if node_state.artifact_digest != artifact_digest:
                 return False, "EVIDENCE_CONFLICT"
             # Same artifact, same status: ignore (replay)
@@ -282,9 +304,9 @@ def process_event(
 
 
 def load_session(db: sqlite3.Connection, session: str) -> SessionState:
-    """Load session state from database"""
+    """Load session state from persistent database"""
     row = db.execute(
-        "SELECT revision, inputs, node_states, event_ids_seen, event_canonical FROM sessions WHERE session = ?",
+        "SELECT revision, inputs, node_states, event_ids_seen, event_canonical FROM pipeline_sessions WHERE session = ?",
         (session,),
     ).fetchone()
     
@@ -314,6 +336,7 @@ def load_session(db: sqlite3.Connection, session: str) -> SessionState:
                 artifact_digest=ns_raw.get("artifact_digest"),
                 event_id=ns_raw.get("event_id"),
                 receipt_id=ns_raw.get("receipt_id"),
+                cache_key=ns_raw.get("cache_key"),
             )
         
         state = SessionState(
@@ -329,7 +352,7 @@ def load_session(db: sqlite3.Connection, session: str) -> SessionState:
 
 
 def save_session(db: sqlite3.Connection, state: SessionState) -> None:
-    """Save session state to database"""
+    """Save session state to persistent database"""
     node_states_json = json.dumps({
         n: {
             "status": state.nodes[n].status,
@@ -337,6 +360,7 @@ def save_session(db: sqlite3.Connection, state: SessionState) -> None:
             "artifact_digest": state.nodes[n].artifact_digest,
             "event_id": state.nodes[n].event_id,
             "receipt_id": state.nodes[n].receipt_id,
+            "cache_key": state.nodes[n].cache_key,
         }
         for n in DAG_NODES
     }, separators=(",", ":"))
@@ -345,7 +369,7 @@ def save_session(db: sqlite3.Connection, state: SessionState) -> None:
     event_canonical_json = json.dumps(state.event_canonical, separators=(",", ":"))
     
     db.execute(
-        "INSERT OR REPLACE INTO sessions (session, revision, inputs, node_states, event_ids_seen, event_canonical) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO pipeline_sessions (session, revision, inputs, node_states, event_ids_seen, event_canonical) VALUES (?, ?, ?, ?, ?, ?)",
         (
             state.session,
             state.revision,
@@ -389,9 +413,7 @@ def validate_request(body: Any) -> tuple[bool, Optional[str]]:
 
 
 def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
-    """Process pipeline request"""
-    db = get_db()
-    
+    """Process pipeline request with proper state management"""
     # Validate request
     is_valid, error_code = validate_request(body)
     if not is_valid:
@@ -402,38 +424,35 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
     new_inputs = body["inputs"]
     events = body["events"]
     
+    db = get_db()
+    
     with DB_LOCK:
         # Load existing session
         session_state = load_session(db, session_str)
         
         # Check for revision conflict
         if session_state.revision != 0:  # Session exists
-            if new_revision != session_state.revision + 1 and new_revision != session_state.revision:
-                # Invalid revision number
+            if new_revision <= session_state.revision:
+                # Invalid revision number: must be strictly increasing or same
                 return {"error": "REVISION_CONFLICT"}
             
-            if new_revision == session_state.revision:
-                # Same revision: check inputs match exactly
-                if new_inputs != session_state.inputs:
-                    return {"error": "REVISION_CONFLICT"}
-                # Inputs match: reuse this revision's data
-            elif new_revision == session_state.revision + 1:
-                # New revision: replace inputs and clear attempt/terminal state
+            if new_revision == session_state.revision + 1:
+                # New revision: validate inputs are different (if different revision expected)
+                # Replace inputs and clear attempt/terminal state, but KEEP succeeded artifacts
                 session_state.revision = new_revision
                 session_state.inputs = new_inputs
-                # Reset all nodes but keep successful artifacts
+                # Clear non-terminal state
                 for n in DAG_NODES:
                     old_state = session_state.nodes[n]
-                    if old_state.status != "succeeded":
-                        session_state.nodes[n] = NodeState()
+                    if old_state.status == "succeeded":
+                        # Keep successful artifacts: they're immutable evidence
+                        pass
                     else:
-                        # Keep artifact but clear other transient state
-                        session_state.nodes[n] = NodeState(
-                            status="succeeded",
-                            artifact_digest=old_state.artifact_digest,
-                            event_id=old_state.event_id,
-                            receipt_id=old_state.receipt_id,
-                        )
+                        # Clear all transient state
+                        session_state.nodes[n] = NodeState()
+            else:
+                # Revision jump > 1 is invalid
+                return {"error": "REVISION_CONFLICT"}
         else:
             # New session
             session_state.revision = new_revision
@@ -450,7 +469,7 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
                 return {"error": error_code}
             
             # Process event
-            should_accept, error_code = process_event(session_state, event, new_revision)
+            should_accept, error_code = process_event(session_state, event)
             if error_code is not None:
                 # Conflict detected: rollback entire batch
                 return {"error": error_code}
@@ -467,6 +486,8 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
     artifact_map = {n: session_state.nodes[n].artifact_digest for n in DAG_NODES}
     
     response_nodes = []
+    has_terminal_failure = False
+    
     for node in DAG_NODES:
         node_state = session_state.nodes[node]
         cache_key = compute_cache_key(node, session_state.inputs, artifact_map)
@@ -476,7 +497,11 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
         reason_codes = []
         triggering_event_ids = []
         
-        if node_state.status == "succeeded":
+        # Check if ancestor had terminal failure
+        if has_terminal_failure:
+            action = "block"
+            reason_codes = ["UPSTREAM_TERMINAL"]
+        elif node_state.status == "succeeded":
             action = "reuse"
             reason_codes = ["CACHE_HIT"]
             if node_state.event_id:
@@ -486,14 +511,18 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
             reason_codes = ["TERMINAL_FAILURE"]
             if node_state.event_id:
                 triggering_event_ids = [node_state.event_id]
-            # Descendants get UPSTREAM_TERMINAL
+            has_terminal_failure = True
         elif node_state.status == "started":
             action = "block"
             reason_codes = ["RUNNING"]
             if node_state.event_id:
                 triggering_event_ids = [node_state.event_id]
-        elif cache_key is None:
+        elif not is_parent_ready(node, session_state):
             # Parent not ready
+            action = "block"
+            reason_codes = ["UPSTREAM_PENDING"]
+        elif cache_key is None:
+            # Can't compute cache key (shouldn't happen if parents ready)
             action = "block"
             reason_codes = ["UPSTREAM_PENDING"]
         else:
@@ -504,7 +533,7 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
             else:
                 reason_codes = ["RETRYABLE_FAILURE"]
         
-        # Build dependency digests
+        # Build dependency digests (in NODE_INPUTS order)
         dependency_digests = {}
         required = NODE_INPUTS[node]
         for key in required:
@@ -515,6 +544,7 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
                 artifact = artifact_map.get(parent_node)
                 if artifact:
                     dependency_digests[key] = artifact
+        
         if cache_key:
             dependency_digests["cacheKey"] = cache_key
         
@@ -532,3 +562,7 @@ def process_pipeline(body: dict[str, Any]) -> dict[str, Any]:
         "ignoredEventIds": ignored_event_ids,
         "nodes": response_nodes,
     }
+
+
+# Initialize database on module load
+init_db()
